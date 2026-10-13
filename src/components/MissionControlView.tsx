@@ -312,7 +312,7 @@ export const MissionControlView: React.FC<MissionControlViewProps> = ({
                       : workflow.phase === 'ESTIMATING_RUL'
                       ? 'SOLVING ROOT...'
                       : rulResult.predictionStatus === 'THRESHOLD_NOT_REACHED_WITHIN_HORIZON'
-                      ? '> 1,000 Hours (1,396h Nominal)'
+                      ? `> 1,000 Hours (${Math.round(rulResult.estimatedRulHours).toLocaleString()}h Nominal)`
                       : `${rulResult.estimatedRulHours.toFixed(1)} Hours`}
                   </span>
                   <span className="text-xs text-slate-400 font-mono">to ΔV_crit ({failureThresholdVth}V)</span>

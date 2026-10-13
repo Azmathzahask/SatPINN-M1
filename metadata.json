@@ -1,0 +1,6 @@
+{
+  "name": "Satellite Reliability AI: PINN + RUL + Agentic Mitigation",
+  "description": "Physics-Informed Neural Network (PINN) and Remaining Useful Life (RUL) prognostics with NOAA GOES space weather telemetry, aerospace RAG, and autonomous safety-constrained satellite mitigation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

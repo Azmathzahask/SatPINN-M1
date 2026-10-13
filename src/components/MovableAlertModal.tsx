@@ -61,7 +61,8 @@ export const MovableAlertModal: React.FC<MovableAlertModalProps> = ({
 }) => {
   // Draggable position state
   const [position, setPosition] = useState<{ x: number; y: number }>(() => {
-    const defaultX = typeof window !== 'undefined' ? Math.max(20, Math.floor((window.innerWidth - 600) / 2)) : 80;
+    const modalWidth = typeof window !== 'undefined' ? Math.min(window.innerWidth * 0.95, 1200) : 1200;
+    const defaultX = typeof window !== 'undefined' ? Math.max(10, Math.floor((window.innerWidth - modalWidth) / 2)) : 80;
     return { x: defaultX, y: 65 };
   });
   const [isDragging, setIsDragging] = useState(false);
@@ -87,8 +88,10 @@ export const MovableAlertModal: React.FC<MovableAlertModalProps> = ({
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
       if (!isDragging) return;
-      const newX = Math.max(10, Math.min(window.innerWidth - 420, e.clientX - dragOffsetRef.current.x));
-      const newY = Math.max(10, Math.min(window.innerHeight - 150, e.clientY - dragOffsetRef.current.y));
+      const modal = modalRef.current;
+      const modalWidth = modal?.offsetWidth ?? Math.min(window.innerWidth * 0.95, 1200);
+      const newX = Math.max(10, Math.min(window.innerWidth - modalWidth - 10, e.clientX - dragOffsetRef.current.x));
+      const newY = Math.max(10, Math.min(window.innerHeight - 80, e.clientY - dragOffsetRef.current.y));
       setPosition({ x: newX, y: newY });
     };
 
@@ -105,6 +108,19 @@ export const MovableAlertModal: React.FC<MovableAlertModalProps> = ({
       window.removeEventListener('mouseup', handleMouseUp);
     };
   }, [isDragging]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      const modalWidth = modalRef.current?.offsetWidth ?? Math.min(window.innerWidth * 0.95, 1200);
+      setPosition(current => ({
+        x: Math.max(10, Math.min(window.innerWidth - modalWidth - 10, current.x)),
+        y: Math.max(10, Math.min(window.innerHeight - 80, current.y))
+      }));
+    };
+
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   if (!isOpen) return null;
 
@@ -190,9 +206,10 @@ export const MovableAlertModal: React.FC<MovableAlertModalProps> = ({
       ref={modalRef}
       style={{
         left: `${position.x}px`,
-        top: `${position.y}px`
+        top: `${position.y}px`,
+        maxHeight: `calc(100vh - ${position.y + 16}px)`
       }}
-      className={`fixed z-50 w-[95vw] sm:w-[600px] rounded-2xl ${theme.modalBg} border-2 backdrop-blur-2xl transition-all select-none`}
+      className={`fixed z-50 flex w-[95vw] max-w-[1200px] flex-col rounded-2xl ${theme.modalBg} border-2 backdrop-blur-2xl transition-all select-none`}
     >
       {/* Draggable Aerospace Flight HUD Title Bar */}
       <div
@@ -243,7 +260,7 @@ export const MovableAlertModal: React.FC<MovableAlertModalProps> = ({
 
       {/* Flight Console Body */}
       {!isMinimized && (
-        <div className="p-4 sm:p-5 flex flex-col gap-4 text-slate-100">
+        <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5 flex flex-col gap-4 text-slate-100">
 
           {/* Recovery Confirmation Banner (Visible when Stabilized) */}
           {workflow.phase === 'MISSION_STABILIZED' && (

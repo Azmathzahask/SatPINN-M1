@@ -80,20 +80,18 @@ export interface AgentDecisionResult {
   }>;
 }
 
-/**
- * Computes dynamic degraded RUL based directly on CME flux severity with realistic physics:
- * - Nominal quiet flux (<=15 pfu): returns > 1000 hours (1500.0h, Case 4: HEALTHY)
- * - CME event spike (>100 pfu, e.g. 4200 pfu): falls to below 100 hours (20.0h, Case 1: CRITICAL)
- */
-export function computeDynamicDegradedRul(flux: number, baseTempC: number = 38.6): number {
+function buildDynamicFluxProfile(flux: number, baseTempC: number) {
   if (flux <= 15.0) {
-    // Nominal solar background (<=15 pfu): Payload operates routinely beyond 1000 hours
-    return 1500.0;
+    const quietFlux = Math.max(1.2, flux);
+    return [
+      { timeHours: 0, flux: quietFlux, tempC: baseTempC },
+      { timeHours: 1500, flux: quietFlux, tempC: baseTempC }
+    ];
   }
 
   const safeFlux = Math.max(10, flux);
   const stormHours = 72;
-  const stormProfile: Array<{ timeHours: number; flux: number; tempC: number }> = [];
+  const profile: Array<{ timeHours: number; flux: number; tempC: number }> = [];
 
   for (let t = 0; t <= stormHours; t += 1.0) {
     const tNorm = t / stormHours;
@@ -102,26 +100,32 @@ export function computeDynamicDegradedRul(flux: number, baseTempC: number = 38.6
       const g = Math.exp(-Math.pow((tNorm - 0.35) / 0.18, 2));
       f = 1.2 + safeFlux * g;
     }
-    stormProfile.push({ timeHours: t, flux: Number(f.toFixed(2)), tempC: baseTempC });
+    profile.push({ timeHours: t, flux: Number(f.toFixed(2)), tempC: baseTempC });
   }
 
   // Trailing decay
   for (let t = stormHours + 5; t <= 500; t += 5.0) {
     const postHours = t - stormHours;
     const decayFlux = Math.max(1.5, 80 * Math.exp(-postHours / 90));
-    stormProfile.push({ timeHours: t, flux: Number(decayFlux.toFixed(2)), tempC: baseTempC });
+    profile.push({ timeHours: t, flux: Number(decayFlux.toFixed(2)), tempC: baseTempC });
   }
 
-  const traj = solveDegradationTrajectory(stormProfile, DEFAULT_PINN_PARAMS, 0.5, 1.20, 0.0, 1.0);
+  return profile;
+}
+
+/**
+ * Computes degraded RUL from a PINN trajectory for the requested radiation profile.
+ */
+export function computeDynamicDegradedRul(flux: number, baseTempC: number = 38.6): number {
+  const profile = buildDynamicFluxProfile(flux, baseTempC);
+  const traj = solveDegradationTrajectory(profile, DEFAULT_PINN_PARAMS, 0.5, 1.20, 0.0, 1.0);
   const result = calculateRulNewtonRaphson(traj, -1.50);
 
   return Number(Math.max(1.0, result.estimatedRulHours).toFixed(1));
 }
 
 /**
- * Computes dynamic recovered RUL based on physical intervention simulation:
- * - On recovery under Safe Mode B (0.95V, duty cycle 0.40, thermal drop to 28.5°C),
- *   RUL recovers to above 200 hours (215h - 240h).
+ * Computes intervention RUL from the PINN trajectory under the selected operating profile.
  */
 export function computeDynamicRecoveredRul(
   flux: number,
@@ -130,29 +134,11 @@ export function computeDynamicRecoveredRul(
   initialDegradationVth: number = 0.0,
   thresholdVth: number = -1.50
 ): number {
-  if (flux <= 15.0) {
-    return 1500.0;
-  }
-
-  const safeFlux = Math.max(10, flux);
-  const stormHours = 72;
-  const stormProfile: Array<{ timeHours: number; flux: number; tempC: number }> = [];
-
-  for (let t = 0; t <= stormHours; t += 1.0) {
-    const tNorm = t / stormHours;
-    let f = 1.2;
-    if (tNorm > 0.15 && tNorm < 0.85) {
-      const g = Math.exp(-Math.pow((tNorm - 0.35) / 0.18, 2));
-      f = 1.2 + safeFlux * g;
-    }
-    stormProfile.push({ timeHours: t, flux: Number(f.toFixed(2)), tempC: baseTempC });
-  }
-
   const sim = simulateIntervention({
     actionId,
     initialDegradationVth,
     failureThresholdVth: thresholdVth,
-    fluxProfile: stormProfile,
+    fluxProfile: buildDynamicFluxProfile(flux, baseTempC),
     baselineVdd: 1.20,
     baselineTempC: baseTempC
   });

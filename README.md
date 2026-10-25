@@ -20,6 +20,12 @@ This repository is a **software prototype**. It does **not** talk to a physical 
 | Packet loss | **Simulated** — a lost attempt is never POSTed |
 | ESP32 sensors / load cutoff | Independent hardware prototype, **not** wired into this comms path |
 
+## PINN implementation
+
+The degradation solver trains a real, deterministic 5–16–16–1 tanh multilayer perceptron for each scenario (5 inputs, two hidden layers of 16 neurons, 1 output). Inputs are normalized time, proton flux, temperature, supply voltage, and duty cycle; the output is threshold-voltage shift. Training combines fit to the independent RK4 trajectory with the governing ODE residual, and anchors the initial condition exactly. RUL is then calculated from the PINN trajectory.
+
+This is an in-app scientific prototype, not a pretrained model or a flight-qualified predictor. Its RK4 reference is generated from the same configured physics model; it has not been validated against historical satellite measurements.
+
 ## Architecture
 
 ```mermaid

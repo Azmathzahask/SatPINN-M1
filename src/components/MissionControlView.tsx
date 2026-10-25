@@ -62,6 +62,7 @@ import {
   WorkflowStatusState
 } from '../types';
 import { PREQUALIFIED_PROFILES } from '../services/aerospaceKnowledgeBase';
+import { PINN_ARCHITECTURE } from '../services/physicsEngine';
 
 interface MissionControlViewProps {
   telemetry: HardwareTelemetry;
@@ -113,16 +114,12 @@ export const MissionControlView: React.FC<MissionControlViewProps> = ({
   const isRecovered = telemetry.activeProfile !== 'NOMINAL';
   const currentProfile = PREQUALIFIED_PROFILES[telemetry.activeProfile] || PREQUALIFIED_PROFILES.NOMINAL;
 
-  // Incident Timeline comparison: Initial nominal health (100h), sharp fall during CME flare to 20.1h,
-  // followed by autonomous mitigation recovery rising back up to 44.1h
-  const origLife = workflow.preMitigationRul !== undefined 
-    ? workflow.preMitigationRul 
-    : (isCmeSpike ? 20.1 : 100);
+  const origLife = workflow.preMitigationRul ?? rulResult.estimatedRulHours;
 
   const targetRecoveredLife = isRecovered 
     ? (workflow.postMitigationRul !== undefined 
         ? workflow.postMitigationRul 
-        : (rulResult.estimatedRulHours > 0 ? rulResult.estimatedRulHours : 44.1))
+        : rulResult.estimatedRulHours)
     : origLife;
 
   const comparisonData = [
@@ -233,7 +230,7 @@ export const MissionControlView: React.FC<MissionControlViewProps> = ({
             <div className="p-3.5 rounded-xl bg-slate-900/60 border border-slate-800/80 flex flex-col gap-2 relative overflow-hidden group hover:border-cyan-500/40 transition-colors">
               <div className="flex items-center justify-between">
                 <span className="text-xs text-slate-400 uppercase tracking-wider font-mono">Prediction</span>
-                <span className="text-[10px] text-cyan-400 font-mono">SciML PINN</span>
+                <span className="text-[10px] text-cyan-400 font-mono">PINN {PINN_ARCHITECTURE.join('-')}</span>
               </div>
               <div className="flex items-center gap-3">
                 <div className="w-11 h-11 rounded-lg bg-slate-950/80 border border-slate-800 flex items-center justify-center p-1">
@@ -251,7 +248,7 @@ export const MissionControlView: React.FC<MissionControlViewProps> = ({
                 </div>
               </div>
               <p className="text-[11px] text-slate-400 leading-relaxed font-sans">
-                Semi-empirical MOS charge transport differential equation embedded in neural surrogate. Tracks trap accumulation under {latestFlux.toFixed(1)} pfu proton fluence.
+                Trains a {PINN_ARCHITECTURE.join('–')} tanh MLP against RK4 reference points and the ODE residual. Tracks trap accumulation under {latestFlux.toFixed(1)} pfu proton fluence.
               </p>
             </div>
 

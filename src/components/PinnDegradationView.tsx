@@ -35,6 +35,8 @@ import {
 import { DegradationPoint, PinnModelParams } from '../types';
 import {
   DEFAULT_PINN_PARAMS,
+  PINN_ARCHITECTURE,
+  PINN_PHYSICS_LOSS_WEIGHT,
   calculateAnnealingRate,
   BOLTZMANN_EV
 } from '../services/physicsEngine';
@@ -90,7 +92,7 @@ export const PinnDegradationView: React.FC<PinnDegradationViewProps> = ({
               Physics-Informed Neural Network (PINN) & SciML Degradation Engine
             </h1>
             <span className="px-2 py-0.5 rounded text-xs font-mono bg-cyan-950 text-cyan-300 border border-cyan-800">
-              PYTORCH PINN SURROGATE
+              TANH PINN · {PINN_ARCHITECTURE.join('–')}
             </span>
           </div>
           <p className="text-xs text-slate-400 font-mono mt-1">
@@ -132,10 +134,10 @@ export const PinnDegradationView: React.FC<PinnDegradationViewProps> = ({
         <div className="p-3 rounded-lg bg-slate-900/80 border border-slate-800">
           <span className="text-xs text-slate-400 font-mono block">3. SciML PINN Loss Function</span>
           <div className="my-1.5 font-mono text-purple-300 text-sm font-bold">
-            L = L<sub>data</sub> + &lambda;<sub>phys</sub> &middot; |Residual|<sup>2</sup>
+            L = L<sub>data</sub> + {PINN_PHYSICS_LOSS_WEIGHT.toFixed(2)} L<sub>phys</sub>
           </div>
           <p className="text-[11px] text-slate-400 leading-relaxed">
-            Enforces physical differential consistency to prevent out-of-distribution CME divergence.
+            Two 16-neuron hidden layers; fits RK4 reference points and the ODE residual with the initial condition enforced exactly.
           </p>
         </div>
       </div>

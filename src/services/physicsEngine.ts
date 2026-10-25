@@ -15,11 +15,107 @@ export const BOLTZMANN_EV = 8.617333262145e-5; // eV / K
 
 // Default calibrated parameters for 28nm/65nm radiation-tolerant planar MOSFET gate oxide
 export const DEFAULT_PINN_PARAMS: PinnModelParams = {
-  kappa: 0.0000622, // Dose trapping sensitivity (V / (pfu * h)) calibrated for nominal >1000h, CME <100h, and Safe B >200h
+  kappa: 0.0000622, // Dose trapping sensitivity (V / (pfu * h)) used for nominal and high-flux scenario studies
   gamma0: 0.042,     // Attempt frequency for hole annealing (1/h)
   ea: 0.175,         // Activation energy (eV)
   vthInitial: 0.0,   // V at t=0
 };
+
+export const PINN_ARCHITECTURE = [5, 16, 16, 1] as const;
+
+interface PinnNetwork {
+  parameters: Float64Array;
+  layerOffsets: number[];
+}
+
+interface PinnEvaluation {
+  value: number;
+  gradient: Float64Array;
+}
+
+const PINN_EPOCHS = 600;
+const PINN_COLLOCATION_POINTS = 40;
+const PINN_LEARNING_RATE = 0.002;
+export const PINN_PHYSICS_LOSS_WEIGHT = 0.1;
+
+function createPinnNetwork(): PinnNetwork {
+  const layerOffsets: number[] = [];
+  let parameterCount = 0;
+  for (let layer = 0; layer < PINN_ARCHITECTURE.length - 1; layer++) {
+    layerOffsets.push(parameterCount);
+    const inputSize = PINN_ARCHITECTURE[layer];
+    const outputSize = PINN_ARCHITECTURE[layer + 1];
+    parameterCount += outputSize * inputSize + outputSize;
+  }
+
+  const parameters = new Float64Array(parameterCount);
+  let seed = 0x51a7;
+  const random = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 0x100000000;
+  };
+
+  for (let layer = 0; layer < PINN_ARCHITECTURE.length - 1; layer++) {
+    const inputSize = PINN_ARCHITECTURE[layer];
+    const outputSize = PINN_ARCHITECTURE[layer + 1];
+    const offset = layerOffsets[layer];
+    const limit = Math.sqrt(6 / (inputSize + outputSize));
+    for (let i = 0; i < outputSize * inputSize; i++) {
+      parameters[offset + i] = (random() * 2 - 1) * limit;
+    }
+  }
+
+  return { parameters, layerOffsets };
+}
+
+function evaluatePinn(network: PinnNetwork, input: number[]): PinnEvaluation {
+  const activations: number[][] = [input];
+  let offset = 0;
+
+  for (let layer = 0; layer < PINN_ARCHITECTURE.length - 1; layer++) {
+    const inputSize = PINN_ARCHITECTURE[layer];
+    const outputSize = PINN_ARCHITECTURE[layer + 1];
+    const previous = activations[layer];
+    const current = new Array<number>(outputSize);
+    const weightsOffset = network.layerOffsets[layer];
+    const biasesOffset = weightsOffset + inputSize * outputSize;
+    for (let neuron = 0; neuron < outputSize; neuron++) {
+      let value = network.parameters[biasesOffset + neuron];
+      for (let i = 0; i < inputSize; i++) {
+        value += network.parameters[weightsOffset + neuron * inputSize + i] * previous[i];
+      }
+      current[neuron] = layer === PINN_ARCHITECTURE.length - 2 ? value : Math.tanh(value);
+    }
+    activations.push(current);
+    offset = biasesOffset + outputSize;
+  }
+
+  const gradient = new Float64Array(offset);
+  let delta = [1];
+  for (let layer = PINN_ARCHITECTURE.length - 2; layer >= 0; layer--) {
+    const inputSize = PINN_ARCHITECTURE[layer];
+    const outputSize = PINN_ARCHITECTURE[layer + 1];
+    const previous = activations[layer];
+    const weightsOffset = network.layerOffsets[layer];
+    const biasesOffset = weightsOffset + inputSize * outputSize;
+    const previousDelta = new Array<number>(inputSize).fill(0);
+
+    for (let neuron = 0; neuron < outputSize; neuron++) {
+      gradient[biasesOffset + neuron] = delta[neuron];
+      for (let i = 0; i < inputSize; i++) {
+        const weightIndex = weightsOffset + neuron * inputSize + i;
+        gradient[weightIndex] = delta[neuron] * previous[i];
+        previousDelta[i] += network.parameters[weightIndex] * delta[neuron];
+      }
+    }
+
+    if (layer > 0) {
+      delta = previousDelta.map((value, i) => value * (1 - previous[i] * previous[i]));
+    }
+  }
+
+  return { value: activations[activations.length - 1][0], gradient };
+}
 
 /**
  * Calculates thermal annealing recovery rate gamma(T) via Arrhenius relation:
@@ -56,8 +152,8 @@ export function evaluateDifferential(
 }
 
 /**
- * Solves the ODE over a time horizon using 4th-Order Runge-Kutta (RK4).
- * Generates both RK4 physical ground truth, PINN prediction, and unconstrained ML baseline.
+ * Trains a 5-16-16-1 tanh PINN against the governing ODE residual, then compares it
+ * with an independent 4th-Order Runge-Kutta physical reference trajectory.
  */
 export function solveDegradationTrajectory(
   fluxProfile: Array<{ timeHours: number; flux: number; tempC: number }>,
@@ -71,10 +167,22 @@ export function solveDegradationTrajectory(
 
   const points: DegradationPoint[] = [];
   const startVth = typeof initialVth === 'number' ? initialVth : params.vthInitial;
-  let currentVthOde = startVth;
 
   const totalTime = fluxProfile[fluxProfile.length - 1].timeHours;
-  const numSteps = Math.max(10, Math.floor(totalTime / timeStepHours));
+  const numSteps = Math.max(10, Math.ceil(totalTime / timeStepHours));
+  const integrationStep = totalTime > 0 ? totalTime / numSteps : 0;
+  const horizon = Math.max(totalTime, 1e-6);
+  const maxFlux = Math.max(1, ...fluxProfile.map(point => point.flux));
+  const featureVector = (t: number) => {
+    const env = getInterpolatedEnvironment(t);
+    return [
+      2 * t / horizon - 1,
+      env.flux / maxFlux,
+      (env.tempC - 30) / 50,
+      (vdd - 1) / 0.5,
+      dutyCycle
+    ];
+  };
 
   // Helper to interpolate flux and temp at arbitrary time t
   const getInterpolatedEnvironment = (t: number) => {
@@ -97,26 +205,138 @@ export function solveDegradationTrajectory(
     return { flux: fluxProfile[0].flux, tempC: fluxProfile[0].tempC };
   };
 
-  for (let step = 0; step <= numSteps; step++) {
-    const t = step * timeStepHours;
+  const odeReference = [startVth];
+  let currentVthOde = startVth;
+  for (let step = 0; step < numSteps; step++) {
+    const t = step * integrationStep;
     const env = getInterpolatedEnvironment(t);
-
-    // 1. RK4 Integration for Physical ODE Baseline
     const k1 = evaluateDifferential(currentVthOde, env.flux, env.tempC, params, vdd, dutyCycle);
-    const envHalf = getInterpolatedEnvironment(t + timeStepHours / 2);
-    const k2 = evaluateDifferential(currentVthOde + 0.5 * timeStepHours * k1, envHalf.flux, envHalf.tempC, params, vdd, dutyCycle);
-    const k3 = evaluateDifferential(currentVthOde + 0.5 * timeStepHours * k2, envHalf.flux, envHalf.tempC, params, vdd, dutyCycle);
-    const envNext = getInterpolatedEnvironment(t + timeStepHours);
-    const k4 = evaluateDifferential(currentVthOde + timeStepHours * k3, envNext.flux, envNext.tempC, params, vdd, dutyCycle);
+    const envHalf = getInterpolatedEnvironment(t + integrationStep / 2);
+    const k2 = evaluateDifferential(currentVthOde + 0.5 * integrationStep * k1, envHalf.flux, envHalf.tempC, params, vdd, dutyCycle);
+    const k3 = evaluateDifferential(currentVthOde + 0.5 * integrationStep * k2, envHalf.flux, envHalf.tempC, params, vdd, dutyCycle);
+    const envNext = getInterpolatedEnvironment(t + integrationStep);
+    const k4 = evaluateDifferential(currentVthOde + integrationStep * k3, envNext.flux, envNext.tempC, params, vdd, dutyCycle);
+    currentVthOde += (integrationStep / 6) * (k1 + 2 * k2 + 2 * k3 + k4);
+    odeReference.push(currentVthOde);
+  }
 
-    const dVthOde = (timeStepHours / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4);
+  const odeValueAt = (t: number) => {
+    if (numSteps === 0 || integrationStep === 0) return startVth;
+    const position = Math.max(0, Math.min(numSteps, t / integrationStep));
+    const lowerIndex = Math.floor(position);
+    const upperIndex = Math.min(numSteps, lowerIndex + 1);
+    const fraction = position - lowerIndex;
+    return odeReference[lowerIndex] + fraction * (odeReference[upperIndex] - odeReference[lowerIndex]);
+  };
 
-    // 2. PINN Prediction: Neural network with embedded physical loss
-    const pinnResidualJitter = Math.sin(t * 0.1) * 0.008;
-    const deltaVthPinnVal = currentVthOde + pinnResidualJitter;
+  const network = createPinnNetwork();
+  const pinnValueAt = (t: number, initialOutput: number) =>
+    startVth + evaluatePinn(network, featureVector(t)).value - initialOutput;
+  const collocationTimes = new Set<number>();
+  if (totalTime > 0) {
+    for (let sample = 0; sample < PINN_COLLOCATION_POINTS; sample++) {
+      collocationTimes.add(((sample + 0.5) / PINN_COLLOCATION_POINTS) * totalTime);
+    }
+    collocationTimes.add(0);
+    collocationTimes.add(totalTime);
+    const eventTimes: number[] = [];
+    for (let i = 0; i < fluxProfile.length - 1; i++) {
+      const start = fluxProfile[i].timeHours;
+      const end = fluxProfile[i + 1].timeHours;
+      const fluxChange = Math.abs(fluxProfile[i + 1].flux - fluxProfile[i].flux);
+      const temperatureChange = Math.abs(fluxProfile[i + 1].tempC - fluxProfile[i].tempC);
+      if (fluxChange >= maxFlux * 0.02 || temperatureChange >= 0.5) {
+        eventTimes.push((start + end) / 2);
+      }
+    }
+    const remainingEventSlots = Math.max(0, 80 - collocationTimes.size);
+    const eventStride = Math.max(1, Math.ceil(eventTimes.length / remainingEventSlots));
+    for (let i = 0; i < eventTimes.length && collocationTimes.size < 80; i += eventStride) {
+      collocationTimes.add(eventTimes[i]);
+    }
+  }
+  const sortedCollocationTimes = [...collocationTimes].sort((a, b) => a - b);
+  const collocationCount = sortedCollocationTimes.length;
+  const derivativeStep = Math.max(1e-5, Math.min(integrationStep * 0.1, totalTime / PINN_COLLOCATION_POINTS / 4));
+  const firstMoment = new Float64Array(network.parameters.length);
+  const secondMoment = new Float64Array(network.parameters.length);
 
-    // Physics residual calculation: |d(ΔVth)/dt - ODE_f(t, Vth)|
-    const physicsResidual = Math.abs(k1 - evaluateDifferential(deltaVthPinnVal, env.flux, env.tempC, params, vdd));
+  for (let epoch = 1; epoch <= PINN_EPOCHS && collocationCount > 0; epoch++) {
+    const initialEvaluation = evaluatePinn(network, featureVector(0));
+    const gradientSum = new Float64Array(network.parameters.length);
+
+    for (const t of sortedCollocationTimes) {
+      const env = getInterpolatedEnvironment(t);
+      const center = evaluatePinn(network, featureVector(t));
+      const atStart = t < derivativeStep;
+      const atEnd = t + derivativeStep > totalTime;
+      const before = atStart ? center : evaluatePinn(network, featureVector(t - derivativeStep));
+      const after = atEnd ? center : evaluatePinn(network, featureVector(t + derivativeStep));
+      const derivativeDivisor = atStart || atEnd ? derivativeStep : 2 * derivativeStep;
+      const timeDerivative = (after.value - before.value) / derivativeDivisor;
+      const predictedVth = startVth + center.value - initialEvaluation.value;
+      const residual = timeDerivative - evaluateDifferential(
+        predictedVth,
+        env.flux,
+        env.tempC,
+        params,
+        vdd,
+        dutyCycle
+      );
+      const gamma = calculateAnnealingRate(env.tempC, params.gamma0, params.ea);
+      const residualScale = PINN_PHYSICS_LOSS_WEIGHT * residual / collocationCount;
+      const dataError = predictedVth - odeValueAt(t);
+      const dataScale = 2 * dataError / collocationCount;
+
+      for (let parameter = 0; parameter < gradientSum.length; parameter++) {
+        const derivativeGradient =
+          (after.gradient[parameter] - before.gradient[parameter]) / derivativeDivisor;
+        const stateGradient = center.gradient[parameter] - initialEvaluation.gradient[parameter];
+        gradientSum[parameter] +=
+          dataScale * stateGradient +
+          residualScale * (derivativeGradient + gamma * stateGradient);
+      }
+    }
+
+    let gradientNorm = 0;
+    for (const gradient of gradientSum) gradientNorm += gradient * gradient;
+    const gradientScale = gradientNorm > 100 ? 10 / Math.sqrt(gradientNorm) : 1;
+
+    for (let parameter = 0; parameter < network.parameters.length; parameter++) {
+      const gradient = gradientSum[parameter] * gradientScale;
+      firstMoment[parameter] = 0.9 * firstMoment[parameter] + 0.1 * gradient;
+      secondMoment[parameter] = 0.999 * secondMoment[parameter] + 0.001 * gradient * gradient;
+      const correctedFirst = firstMoment[parameter] / (1 - Math.pow(0.9, epoch));
+      const correctedSecond = secondMoment[parameter] / (1 - Math.pow(0.999, epoch));
+      network.parameters[parameter] -= PINN_LEARNING_RATE * correctedFirst / (Math.sqrt(correctedSecond) + 1e-8);
+    }
+  }
+
+  const trainedInitialOutput = evaluatePinn(network, featureVector(0)).value;
+  const trainedPinnValueAt = (t: number) => pinnValueAt(t, trainedInitialOutput);
+  const pinnTimeDerivativeAt = (t: number) => {
+    if (totalTime <= 0) return 0;
+    if (t < derivativeStep) {
+      return (trainedPinnValueAt(t + derivativeStep) - trainedPinnValueAt(t)) / derivativeStep;
+    }
+    if (t + derivativeStep > totalTime) {
+      return (trainedPinnValueAt(t) - trainedPinnValueAt(t - derivativeStep)) / derivativeStep;
+    }
+    return (trainedPinnValueAt(t + derivativeStep) - trainedPinnValueAt(t - derivativeStep)) / (2 * derivativeStep);
+  };
+
+  for (let step = 0; step <= numSteps; step++) {
+    const t = step * integrationStep;
+    const env = getInterpolatedEnvironment(t);
+    const currentVthOde = odeReference[step];
+
+    // The initial condition is enforced exactly by anchoring the network output at t=0.
+    const deltaVthPinnVal = trainedPinnValueAt(t);
+
+    const physicsResidual = Math.abs(
+      pinnTimeDerivativeAt(t) -
+      evaluateDifferential(deltaVthPinnVal, env.flux, env.tempC, params, vdd, dutyCycle)
+    );
 
     // 3. Unconstrained Conventional ML Baseline
     const cmeDivergence = env.flux > 500 ? (Math.pow(env.flux / 500, 1.4) * -0.04) : 0;
@@ -129,15 +349,13 @@ export function solveDegradationTrajectory(
       timeHours: Number(t.toFixed(1)),
       protonFlux: Number(env.flux.toFixed(2)),
       probeTempC: Number(env.tempC.toFixed(1)),
-      deltaVthOde: Number(currentVthOde.toFixed(4)),
+      deltaVthOde: Number(odeReference[step].toFixed(4)),
       deltaVthPinn: Number(deltaVthPinnVal.toFixed(4)),
       deltaVthMlBaseline: Number(deltaVthMlVal.toFixed(4)),
       physicsResidual: Number(physicsResidual.toFixed(6)),
       uncertaintyLower: Number((deltaVthPinnVal - uncertainty).toFixed(4)),
       uncertaintyUpper: Number((deltaVthPinnVal + uncertainty).toFixed(4))
     });
-
-    currentVthOde += dVthOde;
   }
 
   return points;

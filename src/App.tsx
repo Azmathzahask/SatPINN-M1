@@ -34,15 +34,9 @@ import {
 import {
   DEFAULT_PINN_PARAMS,
   solveDegradationTrajectory,
-  calculateRulNewtonRaphson,
-  selectRiskLevel
+  calculateRulNewtonRaphson
 } from './services/physicsEngine';
 
-import {
-  computeDynamicDegradedRul,
-  computeDynamicRecoveredRul,
-  runAutonomousAgentDeliberation
-} from './services/autonomousAgent';
 import { simulateIntervention } from './services/interventionSimulator';
 
 import {
@@ -145,13 +139,15 @@ export default function App() {
     records: SpaceWeatherRecord[],
     currentParams: PinnModelParams,
     currentTemp: number,
-    threshold: number
+    threshold: number,
+    currentVdd = telemetry.vdd,
+    activeProfile = telemetry.activeProfile
   ) => {
-    if (records.length === 0) return;
+    if (records.length === 0) return undefined;
 
     // If active workflow is in Stage 1 RED_ALERT, keep RUL pending until Stage 2 ODE solver runs
     if (workflow.phase === 'RED_ALERT') {
-      return;
+      return undefined;
     }
 
     const isQuiet = records.every(r => r.flux <= 15.0);
@@ -185,31 +181,15 @@ export default function App() {
     }
 
     // Determine target profile duty cycle
-    const activeProf = PREQUALIFIED_PROFILES[telemetry.activeProfile];
+    const activeProf = PREQUALIFIED_PROFILES[activeProfile];
     const dutyCycle = activeProf ? activeProf.dutyCycle : 1.0;
 
-    const traj = solveDegradationTrajectory(profile, currentParams, 0.5, telemetry.vdd, 0.0, dutyCycle);
+    const traj = solveDegradationTrajectory(profile, currentParams, 0.5, currentVdd, 0.0, dutyCycle);
     setTrajectory(traj);
-
-    // If mission is stabilized or recovering in Safe Hold Mode B, retain the recovered RUL calculation (44.1h)
-    if (workflow.phase === 'MISSION_STABILIZED' || workflow.phase === 'EXECUTING_MITIGATION' || workflow.phase === 'POST_MITIGATION_RAG' || telemetry.activeProfile === 'SAFE_LOW_POWER_B') {
-      const recoveredRul = 44.1;
-      setRulResult({
-        estimatedRulHours: recoveredRul,
-        failureThresholdVth: threshold,
-        riskBand: selectRiskLevel(recoveredRul),
-        solverMethod: 'Newton-Raphson + Brent Bracketed',
-        converged: true,
-        iterations: 3,
-        trajectoryHorizonHours: 200,
-        uncertaintyHours: Number((recoveredRul * 0.05).toFixed(1)),
-        reasoningNotes: 'Recovered RUL under Safe Hold Mode B (0.95V DVFS): slows hole trapping by 2.2x.'
-      });
-      return;
-    }
 
     const rul = calculateRulNewtonRaphson(traj, threshold);
     setRulResult(rul);
+    return rul;
   }, [telemetry.activeProfile, telemetry.vdd, workflow.phase]);
 
   function generateSyntheticStorm(
@@ -285,7 +265,7 @@ export default function App() {
 
   // ================= TIMED AUTONOMOUS SEQUENCE ENGINE =================
   // 1. Red Alert: Hazard detection broadcast without premature RUL guessing
-  // 2. "Estimating RUL": Newton-Raphson ODE solver computes dynamic degraded RUL based on flare flux
+  // 2. "Estimating RUL": PINN predicts degradation and Newton-Raphson estimates threshold crossing
   // 3. Evaluates autonomous agent reasoning and RAG knowledge base for RUL bands
   // 4. Takes voltage reduction action (DVFS cut to 0.95V), causing dynamic RUL extension
   // 5. Downlinks telemetry to Ground Station
@@ -301,9 +281,21 @@ export default function App() {
     const storm = generateSyntheticStorm(flux, 72, 'GOES-18', '>=10 MeV');
     setSpaceWeatherRecords(storm);
 
-    // Dynamically compute degraded RUL (20.1h) and recovered RUL (44.1h)
-    const dynamicDegradedRul = 20.1;
-    const dynamicRecoveredRul = 44.1;
+    const simulation = simulateIntervention({
+      actionId: 'SAFE_LOW_POWER_B',
+      initialDegradationVth: 0,
+      failureThresholdVth,
+      fluxProfile: storm.map((record, index) => ({
+        timeHours: index,
+        flux: record.flux,
+        tempC: 38.6
+      })),
+      baselineVdd: 1.2,
+      baselineTempC: 38.6,
+      pinnParams
+    });
+    const dynamicDegradedRul = simulation.baselineRul.estimatedRulHours;
+    const dynamicRecoveredRul = simulation.interventionRul.estimatedRulHours;
 
     // Reset telemetry to Nominal so the transition is visibly demonstrated
     setTelemetry({
@@ -392,19 +384,8 @@ export default function App() {
     setTimeout(() => {
       clearInterval(p1Interval);
 
-      // Recompute physics under acute CME flux to display newly calculated dynamic degraded RUL
-      recomputePhysics(storm, pinnParams, 38.6, failureThresholdVth);
-      setRulResult({
-        estimatedRulHours: dynamicDegradedRul,
-        failureThresholdVth,
-        riskBand: selectRiskLevel(dynamicDegradedRul),
-        solverMethod: 'Newton-Raphson + Brent Bracketed',
-        converged: true,
-        iterations: 4,
-        trajectoryHorizonHours: 500,
-        uncertaintyHours: Number((dynamicDegradedRul * 0.08).toFixed(1)),
-        reasoningNotes: `Case 1 — Critical (RUL <= 100h): Severe CME proton spike (${flux} pfu). Newton-Raphson solved RUL = ${dynamicDegradedRul}h.`
-      });
+      setTrajectory(simulation.baselineTrajectory);
+      setRulResult(simulation.baselineRul);
 
       setWorkflow({
         phase: 'ESTIMATING_RUL',
@@ -503,27 +484,14 @@ export default function App() {
             timestamp: new Date().toISOString()
           }));
 
-          // DYNAMIC INCREASE IN RUL: Computed from physics ODE for this specific flux
-          setRulResult({
-            estimatedRulHours: dynamicRecoveredRul,
-            failureThresholdVth,
-            riskBand: dynamicRecoveredRul >= 500 ? 'NOMINAL' : dynamicRecoveredRul >= 250 ? 'WARNING' : 'HIGH',
-            solverMethod: 'Newton-Raphson + Brent Bracketed',
-            converged: true,
-            iterations: 3,
-            trajectoryHorizonHours: 200,
-            uncertaintyHours: Number((dynamicRecoveredRul * 0.05).toFixed(1)),
-            reasoningNotes: `Recovered RUL: Safe Hold Mode B (0.95V DVFS reduction) slowing gate oxide charge trapping under ${flux} pfu.`
-          });
-
-          recomputePhysics(storm, pinnParams, newTemp, failureThresholdVth);
-          setRulResult(prev => ({ ...prev, estimatedRulHours: dynamicRecoveredRul }));
+          setTrajectory(simulation.interventionTrajectory);
+          setRulResult(simulation.interventionRul);
 
           setWorkflow({
             phase: 'EXECUTING_MITIGATION',
             secondsRemaining: 2.0,
-            phaseTitle: `VOLTAGE REDUCTION APPLIED (DVFS 0.95V) — RUL RECOVERED TO ${dynamicRecoveredRul}h`,
-            phaseDetails: `Core supply reduced to 0.95V. Clock duty cut to 40%. Major RUL extension: ${dynamicDegradedRul}h -> ${dynamicRecoveredRul} Hours! Dual RGB LED switched to GREEN.`,
+            phaseTitle: `VOLTAGE REDUCTION APPLIED (DVFS 0.95V) — RUL RECOVERED TO ${dynamicRecoveredRul.toFixed(1)}h`,
+            phaseDetails: `Core supply reduced to 0.95V. Clock duty cut to 40%. Major RUL extension: ${dynamicDegradedRul.toFixed(1)}h -> ${dynamicRecoveredRul.toFixed(1)}h! Dual RGB LED switched to GREEN.`,
             voltageReductionTarget: 0.95,
             postMitigationRul: dynamicRecoveredRul,
             preMitigationRul: dynamicDegradedRul
@@ -654,17 +622,7 @@ export default function App() {
             setTimeout(() => {
               clearInterval(transferInterval);
 
-              setRulResult({
-                estimatedRulHours: dynamicRecoveredRul,
-                failureThresholdVth,
-                riskBand: selectRiskLevel(dynamicRecoveredRul) as any,
-                solverMethod: 'Newton-Raphson + Brent Bracketed',
-                converged: true,
-                iterations: 3,
-                trajectoryHorizonHours: 200,
-                uncertaintyHours: Number((dynamicRecoveredRul * 0.05).toFixed(1)),
-                reasoningNotes: `Recovered RUL: Safe Hold Mode B (0.95V DVFS reduction) stabilizes MOS oxide charge trapping under ${flux} pfu.`
-              });
+              setRulResult(simulation.interventionRul);
 
               setWorkflow({
                 phase: 'MISSION_STABILIZED',
@@ -732,7 +690,7 @@ export default function App() {
       }, 3500);
 
     }, 5000);
-  }, [pinnParams, failureThresholdVth, telemetry.connectionMode, recomputePhysics, cmeSeverityFlux]);
+  }, [pinnParams, failureThresholdVth, telemetry.connectionMode, cmeSeverityFlux]);
 
   // Execute manual profile change
   const handleExecuteMitigation = useCallback((profileId: OperatingProfileId) => {
@@ -779,25 +737,14 @@ export default function App() {
     };
     setAuditLogs(prev => [logEntry, ...prev]);
 
-    if (target.isSafeMode || target.id === 'SAFE_LOW_POWER_B') {
-      const recoveredRul = 44.1;
-      const risk = selectRiskLevel(recoveredRul) as any;
-      setRulResult({
-        estimatedRulHours: recoveredRul,
-        failureThresholdVth,
-        riskBand: risk,
-        solverMethod: 'Newton-Raphson + Brent Bracketed',
-        converged: true,
-        iterations: 3,
-        trajectoryHorizonHours: 200,
-        uncertaintyHours: Number((recoveredRul * 0.05).toFixed(1)),
-        reasoningNotes: `Recovered RUL: Safe Hold Mode B (${target.vddTarget}V DVFS reduction) stabilizes oxide charge trapping.`
-      });
-      recomputePhysics(spaceWeatherRecords, pinnParams, newTemp, failureThresholdVth);
-      setRulResult(prev => ({ ...prev, estimatedRulHours: recoveredRul, riskBand: risk }));
-    } else {
-      recomputePhysics(spaceWeatherRecords, pinnParams, newTemp, failureThresholdVth);
-    }
+    recomputePhysics(
+      spaceWeatherRecords,
+      pinnParams,
+      newTemp,
+      failureThresholdVth,
+      target.vddTarget,
+      target.id
+    );
     showToast(`Manual Command: Applied ${target.name} (${target.vddTarget}V).`);
   }, [telemetry, rulResult.riskBand, pinnParams, spaceWeatherRecords, failureThresholdVth, recomputePhysics]);
 
@@ -817,18 +764,7 @@ export default function App() {
       activeProfile: 'NOMINAL',
       lastCommandAck: 'ACK_SYSTEM_RESET_NOMINAL'
     });
-    recomputePhysics(quiet, DEFAULT_PINN_PARAMS, 38.6, failureThresholdVth);
-    setRulResult({
-      estimatedRulHours: 1500.0,
-      failureThresholdVth,
-      riskBand: 'HEALTHY',
-      solverMethod: 'Newton-Raphson + Brent Bracketed',
-      converged: true,
-      iterations: 2,
-      trajectoryHorizonHours: 200,
-      uncertaintyHours: 50,
-      reasoningNotes: 'Quiet solar environment: satellite within nominal operational envelope (RUL > 1000h).'
-    });
+    recomputePhysics(quiet, DEFAULT_PINN_PARAMS, 38.6, failureThresholdVth, 1.2, 'NOMINAL');
     setWorkflow({
       phase: 'IDLE_NOMINAL',
       secondsRemaining: 0,
